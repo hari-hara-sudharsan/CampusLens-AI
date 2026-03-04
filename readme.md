@@ -9,8 +9,8 @@ Built for **GDG Winter 2026 Hackathon** @ Oregon State University.
 
 ### 1. Clone & Enter Project
 ```bash
-git clone https://github.com/YOUR_USERNAME/campuslens-ai.git
-cd campuslens-ai
+git clone https://github.com/hari-hara-sudharsan-j/CampusLens-AI.git
+cd CampusLens-AI
 ```
 
 ### 2. Set Up Backend
