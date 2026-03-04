@@ -53,7 +53,7 @@ open ../frontend/index.html
 
 ## 📁 Project Structure
 ```
-campuslens-ai/
+CampusLens-AI/
 ├── backend/
 │   ├── main.py              # FastAPI app — all routes here
 │   ├── requirements.txt     # Python dependencies
