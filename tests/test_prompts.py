@@ -26,13 +26,13 @@ from prompts import (
     SYSTEM_PROMPT,
 )
 from mock_syllabi import MOCK_SYLLABI, EXPECTED_SCORES
-import anthropic
+import openai
 from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 
-client = anthropic.Anthropic()
-MODEL = "claude-opus-4-5"
+client = openai.OpenAI()
+MODEL = "gpt-4o-mini"
 
 # ─── COLORS ────────────────────────────────────────────────
 GREEN  = "\033[92m"
@@ -173,18 +173,20 @@ def run_test(name: str, text: str, show_full: bool = False) -> dict:
         strategy = "full"
     info(f"Prompt strategy: {strategy}")
 
-    # Call Claude
+    # Call OpenAI
     try:
-        message = client.messages.create(
+        completion = client.chat.completions.create(
             model=MODEL,
             max_tokens=2500,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt}
+            ],
         )
-        raw = "".join(b.text for b in message.content if hasattr(b, "text"))
+        raw = completion.choices[0].message.content
         info(f"Raw response length: {len(raw)} chars")
     except Exception as e:
-        fail(f"Claude API call failed: {e}")
+        fail(f"OpenAI API call failed: {e}")
         return {"passed": 0, "total": 1, "name": name, "error": str(e)}
 
     # Parse JSON
