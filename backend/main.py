@@ -1,22 +1,45 @@
 """
-CampusLens AI - Backend API
+CampusLens AI — Backend API  (Day 2 Upgrade)
+============================================
 FastAPI + Claude API + pdfplumber
+New in Day 2:
+  - Engineered prompts with difficulty rubric & flag guides
+  - Multi-strategy PDF extraction with fallback chain
+  - JSON repair loop (up to 2 retries on malformed output)
+  - Sparse-syllabus detection → lighter prompt
+  - /analyze now returns extraction metadata
+  - /compare now returns head-to-head breakdown
+  - /batch endpoint: analyze up to 5 syllabi at once
+  - /ping health check with model info
 """
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+import asyncio
+import json
+import time
+from typing import Optional
+
+import anthropic
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import pdfplumber
-import anthropic
-import json
-import io
-import re
-from typing import Optional
-from pydantic import BaseModel
 
-app = FastAPI(title="CampusLens AI", version="1.0.0")
+from pdf_extractor import ExtractionResult, extract_pdf_text, get_extraction_error_message
+from prompts import (
+    SYSTEM_PROMPT,
+    build_compare_prompt,
+    build_main_prompt,
+    build_repair_prompt,
+    build_sparse_prompt,
+    extract_json_from_text,
+    validate_and_fix,
+)
 
-# Allow frontend to call this API
+app = FastAPI(
+    title="CampusLens AI",
+    version="2.0.0",
+    description="AI-powered syllabus analyzer for OSU students",
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,138 +48,138 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
+client = anthropic.Anthropic()
+MODEL = "claude-opus-4-5"
+MAX_RETRIES = 2  # JSON repair attempts
 
 
-# ─────────────────────────────────────────────
-#  HELPERS
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+#  CORE AI CALLER  (with repair loop)
+# ─────────────────────────────────────────────────────────────
 
-def extract_text_from_pdf(file_bytes: bytes) -> str:
-    """Extract all text from PDF bytes using pdfplumber."""
-    text_parts = []
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                text_parts.append(text)
-    return "\n".join(text_parts)
-
-
-def build_analysis_prompt(syllabus_text: str) -> str:
-    return f"""You are an expert academic advisor analyzing a university course syllabus.
-Analyze the following syllabus text and return ONLY a valid JSON object (no markdown, no explanation).
-
-Syllabus Text:
-\"\"\"
-{syllabus_text[:8000]}
-\"\"\"
-
-Return this exact JSON structure:
-{{
-  "course_name": "string",
-  "course_code": "string or null",
-  "instructor": "string or null",
-  "credits": "number or null",
-  "difficulty_score": <integer 1-10>,
-  "difficulty_label": "Easy | Moderate | Hard | Very Hard",
-  "weekly_hours_min": <integer>,
-  "weekly_hours_max": <integer>,
-  "workload_breakdown": {{
-    "lectures": "e.g. 3 hrs/week",
-    "assignments": "e.g. 2-4 hrs/week",
-    "projects": "e.g. varies",
-    "exams": "e.g. 3 midterms + final"
-  }},
-  "key_topics": ["topic1", "topic2", "topic3", "topic4", "topic5"],
-  "skills_you_will_learn": ["skill1", "skill2", "skill3"],
-  "red_flags": [
-    {{"flag": "short description", "severity": "low|medium|high"}}
-  ],
-  "green_flags": ["positive aspect 1", "positive aspect 2"],
-  "grade_breakdown": [
-    {{"component": "Homework", "weight": 30}},
-    {{"component": "Midterm", "weight": 30}},
-    {{"component": "Final", "weight": 40}}
-  ],
-  "study_strategies": ["strategy1", "strategy2", "strategy3"],
-  "survival_tips": ["tip1", "tip2"],
-  "recommended_for": "string - type of student who would thrive",
-  "not_recommended_for": "string - who might struggle",
-  "overall_summary": "2-3 sentence honest summary of this course"
-}}"""
+def call_claude(user_prompt: str, max_tokens: int = 2500) -> str:
+    """Call Claude and return raw text response."""
+    message = client.messages.create(
+        model=MODEL,
+        max_tokens=max_tokens,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_prompt}],
+    )
+    return "".join(
+        block.text for block in message.content if hasattr(block, "text")
+    )
 
 
-def parse_claude_response(content: list) -> dict:
-    """Extract JSON from Claude's response content blocks."""
-    full_text = ""
-    for block in content:
-        if hasattr(block, "text"):
-            full_text += block.text
+def call_claude_with_json_repair(
+    user_prompt: str,
+    max_tokens: int = 2500,
+) -> dict:
+    """
+    Call Claude and robustly parse JSON.
+    If parsing fails, ask Claude to repair its own output (up to MAX_RETRIES).
+    """
+    raw_response = call_claude(user_prompt, max_tokens)
 
-    # Strip markdown fences if any
-    cleaned = re.sub(r"```json|```", "", full_text).strip()
-    return json.loads(cleaned)
+    # Attempt 1: direct extraction
+    result = extract_json_from_text(raw_response)
+    if result is not None:
+        return result
+
+    # Retry loop: ask Claude to fix its own JSON
+    last_raw = raw_response
+    for attempt in range(MAX_RETRIES):
+        repair_prompt = build_repair_prompt(last_raw, "JSON parsing failed")
+        last_raw = call_claude(repair_prompt, max_tokens=1500)
+        result = extract_json_from_text(last_raw)
+        if result is not None:
+            result["_repaired"] = True
+            return result
+
+    raise ValueError(
+        f"Claude returned invalid JSON after {MAX_RETRIES} repair attempts. "
+        f"Raw response preview: {raw_response[:300]}"
+    )
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+#  SHARED ANALYSIS LOGIC
+# ─────────────────────────────────────────────────────────────
+
+async def analyze_file(upload: UploadFile) -> dict:
+    """Full pipeline: validate → extract → prompt → parse → validate."""
+    t_start = time.time()
+
+    # File type check
+    if not upload.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
+
+    file_bytes = await upload.read()
+    if len(file_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large. Max 10MB.")
+
+    # ── PDF EXTRACTION ──
+    extraction: ExtractionResult = extract_pdf_text(file_bytes)
+
+    if not extraction.is_usable and extraction.char_count < 50:
+        raise HTTPException(
+            status_code=422,
+            detail=get_extraction_error_message(extraction),
+        )
+
+    # ── CHOOSE PROMPT STRATEGY ──
+    is_sparse = extraction.char_count < 500 or extraction.quality == "poor"
+    if is_sparse:
+        prompt = build_sparse_prompt(extraction.text)
+    else:
+        prompt = build_main_prompt(extraction.text)
+
+    # ── CALL CLAUDE ──
+    try:
+        raw_result = call_claude_with_json_repair(prompt)
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except anthropic.APIError as e:
+        raise HTTPException(status_code=502, detail=f"Claude API error: {str(e)}")
+
+    # ── VALIDATE & FIX ──
+    result = validate_and_fix(raw_result)
+
+    # ── ATTACH METADATA ──
+    result["_meta"] = {
+        "filename": upload.filename,
+        "file_size_kb": round(len(file_bytes) / 1024, 1),
+        "page_count": extraction.page_count,
+        "char_count": extraction.char_count,
+        "extraction_method": extraction.method,
+        "extraction_quality": extraction.quality,
+        "prompt_strategy": "sparse" if is_sparse else "full",
+        "analysis_time_seconds": round(time.time() - t_start, 2),
+        "warnings": extraction.warnings,
+    }
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────
 #  ROUTES
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
-    return {"message": "CampusLens AI is running 🎓"}
+    return {
+        "name": "CampusLens AI",
+        "version": "2.0.0",
+        "endpoints": ["/analyze", "/compare", "/batch", "/health", "/docs"],
+    }
 
 
 @app.post("/analyze")
 async def analyze_syllabus(file: UploadFile = File(...)):
     """
-    Main endpoint: upload a syllabus PDF → get AI analysis back.
+    Analyze a single syllabus PDF.
+    Returns full structured analysis with metadata.
     """
-    # Validate file type
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
-
-    # Read file bytes
-    file_bytes = await file.read()
-    if len(file_bytes) > 10 * 1024 * 1024:  # 10MB limit
-        raise HTTPException(status_code=400, detail="File too large. Max 10MB.")
-
-    # Extract text
-    try:
-        syllabus_text = extract_text_from_pdf(file_bytes)
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Could not read PDF: {str(e)}")
-
-    if len(syllabus_text.strip()) < 100:
-        raise HTTPException(
-            status_code=422,
-            detail="PDF appears to be scanned/image-based or has very little text.",
-        )
-
-    # Call Claude API
-    try:
-        message = client.messages.create(
-            model="claude-opus-4-5",
-            max_tokens=2048,
-            messages=[
-                {
-                    "role": "user",
-                    "content": build_analysis_prompt(syllabus_text),
-                }
-            ],
-        )
-        result = parse_claude_response(message.content)
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=500, detail=f"AI returned invalid JSON: {str(e)}")
-    except anthropic.APIError as e:
-        raise HTTPException(status_code=502, detail=f"Claude API error: {str(e)}")
-
-    # Add metadata
-    result["filename"] = file.filename
-    result["char_count"] = len(syllabus_text)
-    result["pages_estimated"] = max(1, len(syllabus_text) // 2000)
-
+    result = await analyze_file(file)
     return JSONResponse(content=result)
 
 
@@ -166,54 +189,81 @@ async def compare_syllabi(
     file2: UploadFile = File(...),
 ):
     """
-    BONUS FEATURE: Compare two syllabi side by side.
+    Compare two syllabi side-by-side.
+    Returns individual analyses + head-to-head breakdown.
     """
-    results = []
-    for f in [file1, file2]:
-        if not f.filename.lower().endswith(".pdf"):
-            raise HTTPException(status_code=400, detail=f"{f.filename} must be a PDF.")
-        file_bytes = await f.read()
-        syllabus_text = extract_text_from_pdf(file_bytes)
-
-        message = client.messages.create(
-            model="claude-opus-4-5",
-            max_tokens=2048,
-            messages=[{"role": "user", "content": build_analysis_prompt(syllabus_text)}],
-        )
-        result = parse_claude_response(message.content)
-        result["filename"] = f.filename
-        results.append(result)
-
-    # Ask Claude for a comparison summary
-    compare_prompt = f"""Compare these two course analyses and return ONLY JSON:
-Course A: {json.dumps(results[0], indent=2)[:3000]}
-Course B: {json.dumps(results[1], indent=2)[:3000]}
-
-Return JSON:
-{{
-  "recommendation": "A or B",
-  "reason": "2-sentence explanation",
-  "easier_course": "A or B",
-  "more_valuable_course": "A or B",
-  "key_differences": ["diff1", "diff2", "diff3"]
-}}"""
-
-    comp_msg = client.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=512,
-        messages=[{"role": "user", "content": compare_prompt}],
+    # Analyze both in parallel
+    analysis_a, analysis_b = await asyncio.gather(
+        analyze_file(file1),
+        analyze_file(file2),
     )
-    comparison = parse_claude_response(comp_msg.content)
+
+    # Generate comparison
+    try:
+        compare_raw = call_claude_with_json_repair(
+            build_compare_prompt(analysis_a, analysis_b),
+            max_tokens=1200,
+        )
+    except (ValueError, anthropic.APIError) as e:
+        compare_raw = {
+            "recommended": "A",
+            "recommendation_strength": "toss-up",
+            "recommendation_reason": "Could not generate comparison analysis.",
+            "error": str(e),
+        }
 
     return JSONResponse(
         content={
-            "course_a": results[0],
-            "course_b": results[1],
-            "comparison": comparison,
+            "course_a": analysis_a,
+            "course_b": analysis_b,
+            "comparison": compare_raw,
+        }
+    )
+
+
+@app.post("/batch")
+async def batch_analyze(files: list[UploadFile] = File(...)):
+    """
+    Analyze up to 5 syllabi at once.
+    Returns array of analyses sorted by difficulty (easiest first).
+    """
+    if len(files) > 5:
+        raise HTTPException(status_code=400, detail="Max 5 files per batch request.")
+    if len(files) < 2:
+        raise HTTPException(status_code=400, detail="Send at least 2 files for batch analysis.")
+
+    results = await asyncio.gather(
+        *[analyze_file(f) for f in files],
+        return_exceptions=True,
+    )
+
+    analyses = []
+    errors = []
+    for i, r in enumerate(results):
+        if isinstance(r, Exception):
+            errors.append({"file": files[i].filename, "error": str(r)})
+        else:
+            analyses.append(r)
+
+    # Sort by difficulty score
+    analyses.sort(key=lambda x: x.get("difficulty_score", 5))
+
+    return JSONResponse(
+        content={
+            "count": len(analyses),
+            "analyses": analyses,
+            "errors": errors,
+            "easiest": analyses[0].get("course_name") if analyses else None,
+            "hardest": analyses[-1].get("course_name") if analyses else None,
         }
     )
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": "claude-opus-4-5"}
+    return {
+        "status": "ok",
+        "version": "2.0.0",
+        "model": MODEL,
+        "features": ["analyze", "compare", "batch", "json_repair", "sparse_fallback"],
+    }
