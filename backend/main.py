@@ -17,8 +17,9 @@ import asyncio
 import json
 import time
 from typing import Optional
-
-import anthropic
+import openai
+import os
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -34,6 +35,8 @@ from prompts import (
     validate_and_fix,
 )
 
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
+
 app = FastAPI(
     title="CampusLens AI",
     version="2.0.0",
@@ -48,55 +51,54 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = anthropic.Anthropic()
-MODEL = "claude-opus-4-5"
+client = openai.OpenAI()
+MODEL = "gpt-4o-mini"
 MAX_RETRIES = 2  # JSON repair attempts
-
 
 # ─────────────────────────────────────────────────────────────
 #  CORE AI CALLER  (with repair loop)
 # ─────────────────────────────────────────────────────────────
 
-def call_claude(user_prompt: str, max_tokens: int = 2500) -> str:
-    """Call Claude and return raw text response."""
-    message = client.messages.create(
+def call_openai(user_prompt: str, max_tokens: int = 2500) -> str:
+    """Call OpenAI and return raw text response."""
+    completion = client.chat.completions.create(
         model=MODEL,
         max_tokens=max_tokens,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_prompt}],
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt}
+        ],
     )
-    return "".join(
-        block.text for block in message.content if hasattr(block, "text")
-    )
+    return completion.choices[0].message.content
 
 
-def call_claude_with_json_repair(
+def call_openai_with_json_repair(
     user_prompt: str,
     max_tokens: int = 2500,
 ) -> dict:
     """
-    Call Claude and robustly parse JSON.
-    If parsing fails, ask Claude to repair its own output (up to MAX_RETRIES).
+    Call OpenAI and robustly parse JSON.
+    If parsing fails, ask OpenAI to repair its own output (up to MAX_RETRIES).
     """
-    raw_response = call_claude(user_prompt, max_tokens)
+    raw_response = call_openai(user_prompt, max_tokens)
 
     # Attempt 1: direct extraction
     result = extract_json_from_text(raw_response)
     if result is not None:
         return result
 
-    # Retry loop: ask Claude to fix its own JSON
+    # Retry loop: ask OpenAI to fix its own JSON
     last_raw = raw_response
     for attempt in range(MAX_RETRIES):
         repair_prompt = build_repair_prompt(last_raw, "JSON parsing failed")
-        last_raw = call_claude(repair_prompt, max_tokens=1500)
+        last_raw = call_openai(repair_prompt, max_tokens=1500)
         result = extract_json_from_text(last_raw)
         if result is not None:
             result["_repaired"] = True
             return result
 
     raise ValueError(
-        f"Claude returned invalid JSON after {MAX_RETRIES} repair attempts. "
+        f"OpenAI returned invalid JSON after {MAX_RETRIES} repair attempts. "
         f"Raw response preview: {raw_response[:300]}"
     )
 
@@ -133,13 +135,13 @@ async def analyze_file(upload: UploadFile) -> dict:
     else:
         prompt = build_main_prompt(extraction.text)
 
-    # ── CALL CLAUDE ──
+    # ── CALL OPENAI ──
     try:
-        raw_result = call_claude_with_json_repair(prompt)
+        raw_result = call_openai_with_json_repair(prompt)
     except ValueError as e:
         raise HTTPException(status_code=500, detail=str(e))
-    except anthropic.APIError as e:
-        raise HTTPException(status_code=502, detail=f"Claude API error: {str(e)}")
+    except openai.APIError as e:
+        raise HTTPException(status_code=502, detail=f"OpenAI API error: {str(e)}")
 
     # ── VALIDATE & FIX ──
     result = validate_and_fix(raw_result)
@@ -200,11 +202,11 @@ async def compare_syllabi(
 
     # Generate comparison
     try:
-        compare_raw = call_claude_with_json_repair(
+        compare_raw = call_openai_with_json_repair(
             build_compare_prompt(analysis_a, analysis_b),
             max_tokens=1200,
         )
-    except (ValueError, anthropic.APIError) as e:
+    except (ValueError, openai.APIError) as e:
         compare_raw = {
             "recommended": "A",
             "recommendation_strength": "toss-up",
