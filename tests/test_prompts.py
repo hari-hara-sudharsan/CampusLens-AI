@@ -27,6 +27,9 @@ from prompts import (
 )
 from mock_syllabi import MOCK_SYLLABI, EXPECTED_SCORES
 import anthropic
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 
 client = anthropic.Anthropic()
 MODEL = "claude-opus-4-5"
